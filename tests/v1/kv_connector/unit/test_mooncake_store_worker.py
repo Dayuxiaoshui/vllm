@@ -525,6 +525,54 @@ def test_tp_shared_receiving_reads_each_local_store_shard():
     assert len(addrs) == len(sizes) == 4
 
 
+def test_pool_key_config_fingerprint_is_part_of_the_key():
+    md = KeyMetadata("test-model", 0, 0, 0, 0, config_fingerprint="abc123def456")
+    assert (
+        PoolKey(md, "deadbeef").to_string()
+        == "test-model@cfg:abc123def456@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@deadbeef"
+    )
+
+
+def _fingerprint(**overrides):
+    cfg = _make_vllm_config()
+    cache_config = SimpleNamespace(
+        cache_dtype=overrides.pop("kv_cache_dtype", "auto"),
+        block_size=16,
+        num_gpu_blocks=10,
+    )
+    cfg.cache_config = cache_config
+    cfg.model_config = SimpleNamespace(
+        dtype=overrides.pop("model_dtype", "bfloat16"),
+        quantization=overrides.pop("quantization", None),
+    )
+    digest, _ = worker.build_store_config_fingerprint(
+        cfg,
+        _make_kv_cache_config(block_size=overrides.pop("block_size", 16)),
+        scheduler_block_size=overrides.pop("scheduler_block_size", 16),
+        hash_block_size=overrides.pop("hash_block_size", 16),
+        topology=overrides.pop("topology", (1, 1, 1, 1)),
+    )
+    assert not overrides, overrides
+    return digest
+
+
+def test_store_config_fingerprint_separates_incompatible_layouts():
+    # Same model directory, different bytes on the wire: none of these may
+    # share a key with the baseline, while a repeat of the baseline must.
+    base = _fingerprint()
+    assert base == _fingerprint()
+    assert len(base) == 12
+    for change in (
+        {"kv_cache_dtype": "fp8"},
+        {"model_dtype": "float16"},
+        {"quantization": "fp8"},
+        {"block_size": 32, "scheduler_block_size": 32},
+        {"hash_block_size": 32},
+        {"topology": (2, 1, 1, 1)},
+    ):
+        assert _fingerprint(**change) != base, change
+
+
 def test_pool_key_cache_prefix_namespaces_and_disambiguates():
     """A non-empty cache_prefix is prepended, and two instances with
     different prefixes never collide on identical block hashes."""
@@ -2706,12 +2754,17 @@ def test_mqa_p4_to_d2_uses_shared_rank_zero_namespace(tmp_path, monkeypatch):
             else:
                 target.add(key)
 
+    # The fingerprint must not depend on the local TP size here, or the P4
+    # producer and D2 consumer would never share a key.
+    fingerprint = w.token_dbs[0].metadata.config_fingerprint
+    assert fingerprint
     assert (
         put_keys
         == get_keys
         == {
             (
                 "test-model@store_pp:1@store_format:tp_shared_mqa"
+                f"@cfg:{fingerprint}"
                 "@tp_rank:0@pcp0@dcp0@pp_rank:0@group:0@68617368"
             )
         }

@@ -11,6 +11,7 @@ and MooncakeDistributedStore integration.
 """
 
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -131,10 +132,60 @@ def _make_mooncake_group_id(metadata: KeyMetadata, chunk_hash: str) -> str:
     # Mooncake group ids describe the lifecycle unit. For vLLM, that unit is
     # a prefix chunk, so shard dimensions stay only in the object key.
     prefix = f"{metadata.cache_prefix}@" if metadata.cache_prefix else ""
+    fingerprint = (
+        f"@cfg:{metadata.config_fingerprint}" if metadata.config_fingerprint else ""
+    )
     return (
         f"vllm-mooncake-store:{prefix}{metadata.model_name}"
-        f"{metadata.store_namespace}@{chunk_hash}"
+        f"{metadata.store_namespace}{fingerprint}@{chunk_hash}"
     )
+
+
+def build_store_config_fingerprint(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    *,
+    scheduler_block_size: int,
+    hash_block_size: int,
+    topology: tuple[int, ...],
+) -> tuple[str, dict[str, Any]]:
+    """Digest the settings that determine a stored block's bytes and shape.
+
+    Two instances of the same model directory that differ in any of these
+    would read each other's blocks as garbage, so the digest is part of every
+    key. ``topology`` carries the parallel sizes a rank-local key depends on;
+    a TP-shared layout passes only what its namespace does not already encode.
+
+    Returns:
+        The 12-hex-digit digest and the components it was built from.
+    """
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    groups = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        try:
+            page_size = spec.page_size_bytes
+        except Exception:
+            page_size = None
+        groups.append((type(spec).__name__, spec.block_size, page_size))
+    components: dict[str, Any] = {
+        "kv_cache_dtype": str(getattr(cache_config, "cache_dtype", "auto")),
+        "model_dtype": str(getattr(model_config, "dtype", None)),
+        "quantization": getattr(model_config, "quantization", None),
+        "mamba_cache_dtype": str(getattr(cache_config, "mamba_cache_dtype", "auto")),
+        "mamba_ssm_cache_dtype": str(
+            getattr(cache_config, "mamba_ssm_cache_dtype", "auto")
+        ),
+        "scheduler_block_size": scheduler_block_size,
+        "hash_block_size": hash_block_size,
+        "groups": groups,
+        "topology": list(topology),
+    }
+    digest = hashlib.sha256(
+        json.dumps(components, sort_keys=True, default=str).encode()
+    ).hexdigest()[:12]
+    return digest, components
 
 
 # Mirrors FileStorageConfig::local_buffer_size in Mooncake C++.
@@ -1694,6 +1745,25 @@ class MooncakeStoreWorker:
         self.store_tp_size, store_namespace, store_layout_cls = (
             self._select_store_layout(extra_config)
         )
+        # A rank-local key is only valid for the exact parallel layout that
+        # wrote it; a TP-shared namespace already fixes store TP and PP.
+        topology = (
+            (self.pcp_size, self.dcp_size)
+            if store_namespace
+            else (self.tp_size, self.pp_size, self.pcp_size, self.dcp_size)
+        )
+        config_fingerprint, fingerprint_components = build_store_config_fingerprint(
+            vllm_config,
+            kv_cache_config,
+            scheduler_block_size=self.block_size,
+            hash_block_size=self.hash_block_size,
+            topology=topology,
+        )
+        logger.info(
+            "Mooncake store key fingerprint %s from %s",
+            config_fingerprint,
+            fingerprint_components,
+        )
         metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
             tp_rank=self.tp_rank,
@@ -1706,6 +1776,7 @@ class MooncakeStoreWorker:
                 )
             ),
             store_namespace=store_namespace,
+            config_fingerprint=config_fingerprint,
         )
         self._group_tp_replication_factors: tuple[int, ...] = (
             self._compute_group_tp_replication_factors()

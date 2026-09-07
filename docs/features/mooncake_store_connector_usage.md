@@ -277,7 +277,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
-- `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
+- `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`. For hybrid Mamba/GDN models the Mamba boundary states of decode blocks are also offloaded, but only if the core retains them: `--prefix-cache-retention-interval` must be set to the block size (the default `0` keeps no Mamba checkpoint past the prompt, so hits still stop at the prompt end).
 - `store_tp_size` (int): Common Store TP for endpoints with different local TP sizes. It supports LBHNC and LBNHC local KV caches, with `store_tp_size >= local_tp_size` and `store_tp_size % local_tp_size == 0`. The current topology is one full-attention cache group, PCP/DCP disabled, and cross-layer blocks disabled. For GQA and MHA, the total KV-head count must be divisible by `store_tp_size`. Store shards contain fixed global KV-head ranges in the local layout. Shared endpoints use the same KV cache layout, pipeline-parallel size, and Store TP. The Store namespace includes the layout and PP size. Unsupported configurations use a topology-specific rank-local namespace.
 
 LBHNC/HND is strongly recommended for TP-sharded Store when supported. LBNHC/NHD
@@ -300,6 +300,25 @@ invariant across TP sizes, so heterogeneous-TP reuse does not guarantee the
 same greedy output as recomputing the prefix at the decode TP size.
 
 ## Notes
+
+### Store Key Layout
+
+Every key is
+
+```text
+[<cache_prefix>@]<model dir name>[<store namespace>]@cfg:<fingerprint>@tp_rank:<r>@pcp<r>@dcp<r>@pp_rank:<r>@group:<g>@<block hash>
+```
+
+`<fingerprint>` is a 12-hex-digit digest of the settings that change a block's
+bytes or shape: KV cache dtype, model dtype, quantization, Mamba cache dtypes,
+scheduler and hash block sizes, every KV cache group's spec, and the parallel
+layout (TP/PP/PCP/DCP sizes for rank-local keys; PCP/DCP only for TP-shared
+namespaces, whose store TP and PP are already in the namespace). Instances of
+the same model directory that differ in any of these therefore never read each
+other's blocks. The worker logs the digest and its inputs at startup. Because
+the digest is part of the key, upgrading to a vLLM that computes it (or
+changing any input) invalidates existing store contents; restart the Mooncake
+master, or accept that the first requests miss.
 
 ### Reproducible Block Hashes Across Processes
 
