@@ -148,6 +148,7 @@ def _make_store_sending_thread(
     replicate_config: object | None = None,
     enable_group_semantics: bool = False,
     supports_group_ids: bool = False,
+    group_specs: list[object] | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -168,6 +169,7 @@ def _make_store_sending_thread(
         replicate_config=replicate_config,
         enable_group_semantics=enable_group_semantics,
         supports_group_ids=supports_group_ids,
+        group_specs=group_specs,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -886,6 +888,7 @@ def _make_partial_tail_send_thread(
     replicate_config=None,
     enable_group_semantics=False,
     supports_group_ids=False,
+    group_specs=None,
 ):
     coord = SimpleNamespace(
         enable_partial_hash_hits=True,
@@ -915,6 +918,7 @@ def _make_partial_tail_send_thread(
         replicate_config=replicate_config,
         enable_group_semantics=enable_group_semantics,
         supports_group_ids=supports_group_ids,
+        group_specs=group_specs,
     )
 
 
@@ -1296,6 +1300,155 @@ def test_sub_block_handoff_warns_when_partial_hash_hits_are_disabled():
     # The aligned snapshot still goes; only the sub-block tail is dropped.
     keys, _addrs, _sizes, _ = store.batch_put_from_multi_buffers.call_args.args
     assert keys == [thread.token_databases[1].key_for(BlockHash(hs[7]))]
+
+
+def _partial_tail_group_specs():
+    return [
+        FullAttentionSpec(block_size=4, num_kv_heads=8, head_size=64, dtype=None),
+        MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+    ]
+
+
+def test_boundary_snapshot_offload_announces_the_mamba_group():
+    """The hand-off path is the only writer of mamba keys, so it must also be
+    the only announcer of them: without an event a group-aware KV router
+    scores every mamba block a miss on the node that just stored it."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    thread = _make_partial_tail_send_thread(
+        store, group_specs=_partial_tail_group_specs()
+    )
+    thread.enable_kv_event = True
+
+    hs = [bytes([i + 1]) * 4 for i in range(8)]
+    assert thread._maybe_offload_boundary_states(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=0,
+            block_ids=([1, 2, 3], [5]),
+            block_hashes=hs,
+            can_save=True,
+            boundary_state_offloads=[(1, 7, 32)],
+            token_ids=list(range(32)),
+        )
+    )
+
+    (event,) = thread.get_kv_events()
+    assert event.group_idx == 1
+    assert event.kv_cache_spec_kind == "mamba"
+    assert event.kv_cache_spec_sliding_window is None
+    assert event.locality == "REMOTE"
+    assert event.block_size == 16
+    assert event.block_hashes == [maybe_convert_block_hash(BlockHash(hs[7]))]
+    # The mamba block spans tokens [16, 32); hs[3] ends at token 16.
+    assert event.parent_block_hash == maybe_convert_block_hash(BlockHash(hs[3]))
+    assert event.token_ids == list(range(16, 32))
+
+
+def test_sub_block_tail_offload_announces_every_group_it_wrote():
+    """The tail hand-off writes the lcm-gap blocks of *all* groups, so each
+    one is announced under its own group with its own block size."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    thread = _make_partial_tail_send_thread(
+        store, group_specs=_partial_tail_group_specs()
+    )
+    thread.enable_kv_event = True
+
+    hs = [bytes([i + 1]) * 4 for i in range(11)]
+    assert thread._maybe_offload_boundary_states(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=0,
+            block_ids=([1, 2, 3], [0, 0, 0]),
+            block_hashes=hs,
+            can_save=True,
+            boundary_state_offloads=[(1, 9, 32), (1, 7, 44)],
+        )
+    )
+
+    events = thread.get_kv_events()
+    assert [(e.group_idx, e.block_hashes) for e in events] == [
+        (1, [maybe_convert_block_hash(BlockHash(hs[7]))]),
+        (0, [maybe_convert_block_hash(BlockHash(hs[0]))]),
+        (0, [maybe_convert_block_hash(BlockHash(hs[1]))]),
+        (0, [maybe_convert_block_hash(BlockHash(hs[2]))]),
+        (1, [maybe_convert_block_hash(BlockHash(hs[10]))]),
+    ]
+    assert [e.kv_cache_spec_kind for e in events] == [
+        "mamba",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "mamba",
+    ]
+    # No token_ids on a boundary-only meta: an event must not invent them.
+    assert all(e.token_ids == [] for e in events)
+
+
+def test_boundary_offload_does_not_announce_keys_that_failed_to_store():
+    """An event is a claim that the key is readable; only the keys the store
+    actually accepted may be announced."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [
+        -1 if index == 0 else 256 for index in range(len(keys))
+    ]
+    thread = _make_partial_tail_send_thread(
+        store, group_specs=_partial_tail_group_specs()
+    )
+    thread.enable_kv_event = True
+
+    hs = [bytes([i + 1]) * 4 for i in range(11)]
+    assert not thread._maybe_offload_boundary_states(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=0,
+            block_ids=([1, 2, 3], [0, 0, 0]),
+            block_hashes=hs,
+            can_save=True,
+            boundary_state_offloads=[(1, 9, 32), (1, 7, 44)],
+        )
+    )
+
+    events = thread.get_kv_events()
+    assert maybe_convert_block_hash(BlockHash(hs[7])) not in [
+        h for e in events for h in e.block_hashes
+    ]
+    assert len(events) == 4
+
+
+def test_boundary_offload_skips_keys_the_store_already_holds():
+    """Re-announcing a key another rank or request already stored would make
+    the router's view depend on which request happened to touch it last."""
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    thread = _make_partial_tail_send_thread(
+        store, group_specs=_partial_tail_group_specs()
+    )
+    thread.enable_kv_event = True
+
+    hs = [bytes([i + 1]) * 4 for i in range(8)]
+    assert thread._maybe_offload_boundary_states(
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=0,
+            block_ids=([1, 2, 3], [5]),
+            block_hashes=hs,
+            can_save=True,
+            boundary_state_offloads=[(1, 7, 32)],
+        )
+    )
+
+    store.batch_put_from_multi_buffers.assert_not_called()
+    assert thread.get_kv_events() == []
 
 
 def test_snapshot_offload_skips_null_handoff_block():

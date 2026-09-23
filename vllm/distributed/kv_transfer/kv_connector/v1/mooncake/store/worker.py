@@ -19,7 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import torch
 import zmq
@@ -84,6 +84,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_kind,
     group_kernel_blocks,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -394,6 +395,16 @@ class KVTransferThread(threading.Thread):
         return events
 
 
+class _BoundaryPut(NamedTuple):
+    """One boundary-state key this rank writes, with the event it will emit."""
+
+    key: str
+    addr: list[int]
+    size: list[int]
+    metadata: KeyMetadata
+    event_spec: tuple[int, int, int, BlockHash]
+
+
 class KVCacheStoreSendingThread(KVTransferThread):
     """Background thread for storing KV cache blocks to the store."""
 
@@ -413,6 +424,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        group_specs: Sequence[KVCacheSpec] | None = None,
     ):
         super().__init__(
             store,
@@ -431,6 +443,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
             list(group_participates)
             if group_participates is not None
             else [True] * len(token_databases)
+        )
+        # Per-group event annotations. A connector's events bypass
+        # `KVCacheManager.take_events`, which is where core-emitted events get
+        # their spec kind, so they have to carry it themselves or consumers
+        # cannot classify the group.
+        self.group_event_kinds: list[str | None] = (
+            [get_kv_cache_spec_kind(spec).value for spec in group_specs]
+            if group_specs is not None
+            else [None] * len(token_databases)
+        )
+        self.group_event_sliding_windows: list[int | None] = (
+            [getattr(spec, "sliding_window", None) for spec in group_specs]
+            if group_specs is not None
+            else [None] * len(token_databases)
         )
         # req_id -> ids of its store jobs that are still queued or running.
         # Keying by store_job_id, which never repeats for the engine's lifetime,
@@ -568,9 +594,41 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._skip_store_requests.clear()
         return True
 
+    def _build_block_stored_event(
+        self,
+        req_meta: ReqMeta,
+        event_spec: tuple[int, int, int, BlockHash],
+        token_ids: list[int],
+    ) -> BlockStored:
+        """Build the event for one logical block this rank just stored."""
+        start, _end, g_idx, block_hash = event_spec
+        db = self.token_databases[g_idx]
+        return BlockStored(
+            block_hashes=[maybe_convert_block_hash(block_hash)],
+            # Store filtering can separate adjacent request blocks, so derive
+            # the predecessor from the request.
+            parent_block_hash=(
+                maybe_convert_block_hash(
+                    req_meta.block_hashes[start // db.hash_block_size - 1]
+                )
+                if start > 0
+                else None
+            ),
+            token_ids=token_ids,
+            block_size=db.block_size,
+            lora_id=None,
+            medium="cpu",
+            lora_name=None,
+            group_idx=g_idx,
+            kv_cache_spec_kind=self.group_event_kinds[g_idx],
+            kv_cache_spec_sliding_window=self.group_event_sliding_windows[g_idx],
+            # The store is a shared pool other instances read from.
+            locality="REMOTE",
+        )
+
     def _boundary_snapshot_puts(
         self, req_meta: ReqMeta, entries: list[tuple[int, int, int]]
-    ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
+    ) -> list[_BoundaryPut]:
         """Puts for committed mamba "align" boundary-state snapshots.
 
         These are block-aligned boundaries, i.e. exactly what the normal save
@@ -590,7 +648,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         resolved positionally.
         """
         hash_block_size = self.coord.hash_block_size
-        puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
+        puts: list[_BoundaryPut] = []
         for group_id, block_id, boundary in entries:
             if boundary == 0 or block_id == NULL_BLOCK_ID:
                 logger.warning_once(
@@ -631,14 +689,21 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if (boundary // db.block_size - 1) % put_step != put_step_rank:
                 continue
             addr, size = db.prepare_value_for_block(block_id)
+            block_hash = req_meta.block_hashes[hash_idx]
             puts.append(
-                (db.key_for(req_meta.block_hashes[hash_idx]), addr, size, db.metadata)
+                _BoundaryPut(
+                    db.key_for(block_hash),
+                    addr,
+                    size,
+                    db.metadata,
+                    (boundary - db.block_size, boundary, group_id, block_hash),
+                )
             )
         return puts
 
     def _sub_block_tail_puts(
         self, req_meta: ReqMeta, entries: list[tuple[int, int, int]]
-    ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
+    ) -> list[_BoundaryPut]:
         """Puts for the request's sub-block partial tail (its last prompt hash
         boundary), so a later request can hit the sub-block prefix.
 
@@ -669,7 +734,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         mamba_offloads = {group_id: block_id for group_id, block_id, _ in entries}
         saved = self._saved_offset.get(req_meta.req_id, 0)
-        puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
+        puts: list[_BoundaryPut] = []
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
                 continue
@@ -719,7 +784,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     )
                     continue
                 addr, size = db.prepare_value_for_block(block_id)
-                puts.append((db.key_for(key_hash), addr, size, db.metadata))
+                puts.append(
+                    _BoundaryPut(
+                        db.key_for(key_hash),
+                        addr,
+                        size,
+                        db.metadata,
+                        (block_idx * db.block_size, valid_end, g_idx, key_hash),
+                    )
+                )
         return puts
 
     def _maybe_offload_boundary_states(self, req_meta: ReqMeta) -> bool:
@@ -771,13 +844,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         if not puts:
             return True
-        keys = [key for key, _, _, _ in puts]
-        addrs = [addr for _, addr, _, _ in puts]
-        sizes = [size for _, _, size, _ in puts]
+        keys = [put.key for put in puts]
+        addrs = [put.addr for put in puts]
+        sizes = [put.size for put in puts]
         group_ids: list[str] | None = (
             [
-                _make_mooncake_group_id(metadata, key.rsplit("@", 1)[-1])
-                for key, _, _, metadata in puts
+                _make_mooncake_group_id(put.metadata, put.key.rsplit("@", 1)[-1])
+                for put in puts
             ]
             if self.enable_group_semantics and self.supports_group_ids
             else None
@@ -803,6 +876,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         missing = [i for i, e in enumerate(exists) if e != 1]
         if not missing:
             return True
+        event_specs = [puts[i].event_spec for i in missing]
         keys = [keys[i] for i in missing]
         addrs = [addrs[i] for i in missing]
         sizes = [sizes[i] for i in missing]
@@ -845,6 +919,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             status="partial_failure" if failed else "ok",
             num_failed_keys=len(failed),
         )
+        self._emit_boundary_events(req_meta, event_specs, set(failed))
         if failed:
             failed_codes = {res[i] for i in failed}
             logger.warning(
@@ -865,6 +940,42 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 "successful boundary-state batch"
             )
         return True
+
+    def _emit_boundary_events(
+        self,
+        req_meta: ReqMeta,
+        event_specs: list[tuple[int, int, int, BlockHash]],
+        failed_indices: set[int],
+    ) -> None:
+        """Announce the boundary-state keys this rank just wrote.
+
+        Without this a hybrid model's mamba groups are invisible to KV-aware
+        routers: ``store_mask`` keeps them out of the positional save, so the
+        hand-off path is the only place their keys are ever created, and a
+        router that intersects per group therefore scores every mamba block a
+        miss on the very node that holds it.
+        """
+        if not self.enable_kv_event:
+            return
+        token_ids_start = req_meta.token_ids_start
+        token_ids_end = token_ids_start + len(req_meta.token_ids or ())
+        stored_events = [
+            self._build_block_stored_event(
+                req_meta,
+                spec,
+                req_meta.token_ids[
+                    spec[0] - token_ids_start : spec[1] - token_ids_start
+                ]
+                if req_meta.token_ids is not None
+                and token_ids_start <= spec[0]
+                and spec[1] <= token_ids_end
+                else [],
+            )
+            for index, spec in enumerate(event_specs)
+            if index not in failed_indices
+        ]
+        if stored_events:
+            self.update_kv_event(stored_events)
 
     def _handle_request(self, req_meta: ReqMeta):
         # The single `finally` is the only way out, so the scheduler releases
@@ -1146,7 +1257,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 ), event_indices in indices_by_event.items():
                     if any(index in failed_indices for index in event_indices):
                         continue
-                    db = self.token_databases[g_idx]
                     token_ids = (
                         event_token_ids[s - token_ids_start : end - token_ids_start]
                         if event_token_ids is not None
@@ -1155,23 +1265,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         else []
                     )
                     stored_events.append(
-                        BlockStored(
-                            block_hashes=[maybe_convert_block_hash(block_hash)],
-                            # Store filtering can separate adjacent request
-                            # blocks, so derive the predecessor from the request.
-                            parent_block_hash=(
-                                maybe_convert_block_hash(
-                                    req_meta.block_hashes[s // db.hash_block_size - 1]
-                                )
-                                if s > 0
-                                else None
-                            ),
-                            token_ids=token_ids,
-                            block_size=db.block_size,
-                            lora_id=None,
-                            medium="cpu",
-                            lora_name=None,
-                            group_idx=g_idx,
+                        self._build_block_stored_event(
+                            req_meta, (s, end, g_idx, block_hash), token_ids
                         )
                     )
 
@@ -2026,6 +2121,7 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                group_specs=[group.kv_cache_spec for group in self._kv_cache_groups],
             )
             self.kv_send_thread.start()
 
