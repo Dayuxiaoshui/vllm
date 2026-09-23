@@ -593,9 +593,36 @@ class KVCacheStoreSendingThread(KVTransferThread):
         puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
         for group_id, block_id, boundary in entries:
             if boundary == 0 or block_id == NULL_BLOCK_ID:
+                logger.warning_once(
+                    "Discarding a mamba boundary-state snapshot with no usable "
+                    "source block; that state is not persisted and cannot be "
+                    "hit later. This indicates the hand-off and the connector "
+                    "disagree about the block table."
+                )
+                logger.debug(
+                    "Unusable boundary snapshot (req=%s, group=%d, block=%d, "
+                    "boundary=%d)",
+                    req_meta.req_id,
+                    group_id,
+                    block_id,
+                    boundary,
+                )
                 continue
             hash_idx = boundary // hash_block_size - 1
             if hash_idx >= len(req_meta.block_hashes):
+                logger.warning_once(
+                    "Discarding a mamba boundary-state snapshot whose boundary "
+                    "is past the request's hashed prefix; that state is not "
+                    "persisted and cannot be hit later."
+                )
+                logger.debug(
+                    "Unhashed boundary snapshot (req=%s, group=%d, boundary=%d,"
+                    " num_hashes=%d)",
+                    req_meta.req_id,
+                    group_id,
+                    boundary,
+                    len(req_meta.block_hashes),
+                )
                 continue
             db = self.token_databases[group_id]
             # Distribute across ranks by the same rule as normal chunks.
@@ -633,6 +660,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if boundary == 0 or boundary // hash_block_size - 1 >= len(
             req_meta.block_hashes
         ):
+            logger.warning_once(
+                "Discarding a mamba sub-block tail hand-off whose boundary is "
+                "past the request's hashed prefix; no group's tail is "
+                "persisted for it and it cannot be hit later."
+            )
             return []
 
         mamba_offloads = {group_id: block_id for group_id, block_id, _ in entries}
@@ -668,6 +700,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 elif block_idx < len(group_blocks):
                     block_id = group_blocks[block_idx]
                 else:
+                    logger.debug(
+                        "Skipping partial-tail block past the connector's "
+                        "block mirror (req=%s, group=%d, block=%d, mirror=%d)",
+                        req_meta.req_id,
+                        g_idx,
+                        block_idx,
+                        len(group_blocks),
+                    )
                     continue
                 if block_id == NULL_BLOCK_ID:
                     logger.debug(
@@ -716,8 +756,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 sub_block.append(entry)
 
         puts = self._boundary_snapshot_puts(req_meta, snapshots)
-        if sub_block and self.coord.enable_partial_hash_hits:
-            puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
+        if sub_block:
+            if self.coord.enable_partial_hash_hits:
+                puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
+            else:
+                # Nothing would ever probe a sub-block key, so the whole class
+                # of tail hand-offs is unwritable for this configuration.
+                logger.warning_once(
+                    "Discarding sub-block mamba boundary-state hand-offs "
+                    "because partial hash hits are disabled; a request whose "
+                    "prefix ends inside a block persists no mamba state and "
+                    "cannot be hit on that group later."
+                )
 
         if not puts:
             return True

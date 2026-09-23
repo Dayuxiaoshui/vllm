@@ -1268,6 +1268,36 @@ def test_mixed_snapshot_and_sub_block_offloads():
     ]
 
 
+def test_sub_block_handoff_warns_when_partial_hash_hits_are_disabled():
+    """Without partial hash hits nothing ever probes a sub-block key, so the
+    whole class of tail hand-offs is unwritable — say so once instead of
+    dropping them silently, since the only other symptom is a lower hit rate.
+    """
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    thread = _make_partial_tail_send_thread(store)
+    thread.coord.enable_partial_hash_hits = False
+
+    hs = [bytes([i + 1]) * 4 for i in range(11)]
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3], [0, 0, 0]),
+        block_hashes=hs,
+        can_save=True,
+        boundary_state_offloads=[(1, 9, 32), (1, 7, 44)],
+    )
+    with patch.object(mooncake_store_worker.logger, "warning_once") as warn:
+        assert thread._maybe_offload_boundary_states(req)
+
+    assert warn.call_count == 1
+    assert "partial hash hits are disabled" in warn.call_args.args[0]
+    # The aligned snapshot still goes; only the sub-block tail is dropped.
+    keys, _addrs, _sizes, _ = store.batch_put_from_multi_buffers.call_args.args
+    assert keys == [thread.token_databases[1].key_for(BlockHash(hs[7]))]
+
+
 def test_snapshot_offload_skips_null_handoff_block():
     """A hand-off the core could not materialize (null block) carries no
     committed state; persisting it would poison the boundary key."""
